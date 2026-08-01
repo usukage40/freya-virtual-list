@@ -31,7 +31,7 @@ Add the dependency to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-freya = { git = "https://github.com/marc2332/freya" }
+freya = { version = "0.4", features = ["sdk"] }
 freya-virtual-list = { git = "https://github.com/usukage40/freya-virtual-list" }
 ```
 

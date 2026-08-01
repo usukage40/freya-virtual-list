@@ -7,7 +7,9 @@ edition = "2021"
 name = "freya_virtual_list"
 
 [dependencies]
-freya = { git = "https://github.com/marc2332/freya", rev = "156512317eda19da23e7b14935c15504b2e368d7", features = ["sdk"] }
+# Pin to crates.io releases (semver-resolved) instead of a git rev so the
+# project tracks stable releases and builds reproducibly for downstream users.
+freya = { version = "0.4", features = ["sdk"] }
 
 [dev-dependencies]
-freya-testing = { git = "https://github.com/marc2332/freya", rev = "156512317eda19da23e7b14935c15504b2e368d7" }
+freya-testing = "0.4"
