@@ -76,6 +76,32 @@ impl HeightData {
         self.measured.len()
     }
 
+    /// Grow the data to `new_len` items, keeping already-measured heights and
+    /// existing chunk sums. New items default to `default_h` and are unmeasured.
+    /// Returns `true` if the length changed. Items are never removed.
+    fn grow(&mut self, new_len: usize) -> bool {
+        let old_len = self.measured.len();
+        if new_len <= old_len {
+            return false;
+        }
+        self.measured.resize(new_len, None);
+        // Top up the partially-filled chunk that the old length ended in.
+        if !old_len.is_multiple_of(CHUNK_SIZE) {
+            let c = old_len / CHUNK_SIZE;
+            let new_end = ((c + 1) * CHUNK_SIZE).min(new_len);
+            self.chunk_sums[c] += self.default_h * (new_end - old_len) as f32;
+        }
+        // Push sums for any brand-new chunks.
+        let old_chunks = old_len.div_ceil(CHUNK_SIZE);
+        let new_chunks = new_len.div_ceil(CHUNK_SIZE);
+        for c in old_chunks..new_chunks {
+            let start = c * CHUNK_SIZE;
+            let end = (start + CHUNK_SIZE).min(new_len);
+            self.chunk_sums.push(self.default_h * (end - start) as f32);
+        }
+        true
+    }
+
     fn height(&self, i: usize) -> f32 {
         self.measured[i].unwrap_or(self.default_h)
     }
@@ -153,6 +179,7 @@ pub struct VirtualList<T, B: Fn(usize, &T, Option<f32>) -> Element + 'static> {
     overscan: usize,
     render_item: B,
     scrollbar_hide_delay: Duration,
+    stick_to_bottom: bool,
     layout: LayoutData,
 }
 
@@ -163,6 +190,7 @@ impl<T: PartialEq, B: Fn(usize, &T, Option<f32>) -> Element> PartialEq for Virtu
             && self.item_gap == other.item_gap
             && self.overscan == other.overscan
             && self.scrollbar_hide_delay == other.scrollbar_hide_delay
+            && self.stick_to_bottom == other.stick_to_bottom
             && self.layout == other.layout
     }
 }
@@ -176,6 +204,7 @@ impl<T, B: Fn(usize, &T, Option<f32>) -> Element + 'static> VirtualList<T, B> {
             overscan: 3,
             render_item,
             scrollbar_hide_delay: Duration::from_millis(800),
+            stick_to_bottom: false,
             layout: LayoutData::default(),
         }
     }
@@ -202,6 +231,21 @@ impl<T, B: Fn(usize, &T, Option<f32>) -> Element + 'static> VirtualList<T, B> {
         self.scrollbar_hide_delay = duration;
         self
     }
+
+    /// Stick the viewport to the bottom of the content (e.g. chat history /
+    /// live log viewers).
+    ///
+    /// When enabled the list starts at the bottom and automatically follows
+    /// content that grows at the end (appended items or a taller last item).
+    /// The moment the user scrolls away from the bottom (wheel or scrollbar
+    /// drag) following pauses and their position is kept stable; scrolling
+    /// back to the bottom resumes following.
+    ///
+    /// Defaults to `false`.
+    pub fn stick_to_bottom(mut self, stick: bool) -> Self {
+        self.stick_to_bottom = stick;
+        self
+    }
 }
 
 impl<T: PartialEq + 'static, B: Fn(usize, &T, Option<f32>) -> Element + 'static> Component
@@ -222,6 +266,10 @@ impl<T: PartialEq + 'static, B: Fn(usize, &T, Option<f32>) -> Element + 'static>
         let mut anchor = use_state(|| (0usize, 0.0f32));
         let mut viewport_h = use_state(|| 0.0f32);
         let mut size = use_state(Area::default);
+        // Whether the viewport should stick to the bottom of the content.
+        // Starts from the builder value; user scrolling away turns it off and
+        // scrolling back to the bottom turns it on again.
+        let mut stick = use_state(|| self.stick_to_bottom);
         // Scrollbar drag: grab offset within the thumb, if dragging.
         let mut drag = use_state(|| None::<f32>);
         // Auto-hide the scrollbar after a period without scrolling/hovering.
@@ -236,24 +284,37 @@ impl<T: PartialEq + 'static, B: Fn(usize, &T, Option<f32>) -> Element + 'static>
         // Rebuild height data when the item count changes.
         // Note: the callback is stored once at mount, so it must read the new
         // value from its `&deps` argument instead of a captured stale copy.
+        // Growing (append) keeps measured heights and the scroll anchor so
+        // content does not jump; only shrinking resets back to the top.
         use_side_effect_with_deps(&item_count, move |n| {
-            *heights.write() = HeightData::new(*n, default_h, gap);
-            *anchor.write() = (0, 0.0);
-            *drag.write() = None;
+            let new_len = *n;
+            if new_len >= heights.peek().len() {
+                heights.write().grow(new_len);
+            } else {
+                *heights.write() = HeightData::new(new_len, default_h, gap);
+                *anchor.write() = (0, 0.0);
+                *drag.write() = None;
+            }
         });
 
         // Keep the stored anchor valid when the content height or viewport changes.
         // Re-runs whenever any of the states it reads change.
+        // While sticking, the anchor follows the bottom-most position so the
+        // viewport stays glued to the end of the content as it grows.
         use_side_effect(move || {
             let vh = *viewport_h.read();
             let hd = heights.read();
             let max_scroll = (hd.total_height() - vh).max(0.0);
-            let (ai, ao) = *anchor.read();
-            let sy = hd.offset_of(ai) + ao;
-            if sy > max_scroll {
-                let (ni, _) = hd.item_at(max_scroll);
-                let off = max_scroll - hd.offset_of(ni);
+            let (ni, _) = hd.item_at(max_scroll);
+            let off = max_scroll - hd.offset_of(ni);
+            if *stick.read() {
                 *anchor.write() = (ni, off.max(0.0));
+            } else {
+                let (ai, ao) = *anchor.read();
+                let sy = hd.offset_of(ai) + ao;
+                if sy > max_scroll {
+                    *anchor.write() = (ni, off.max(0.0));
+                }
             }
         });
 
@@ -271,9 +332,16 @@ impl<T: PartialEq + 'static, B: Fn(usize, &T, Option<f32>) -> Element + 'static>
         let scroll_y = heights.read().offset_of(ai) + ao;
         let total = heights.read().total_height();
         let max_scroll = (total - vh).max(0.0);
-        // Clamp the derived scroll so content that shrank below the viewport
-        // does not leave a blank area.
-        let sy = scroll_y.min(max_scroll);
+        // While sticking to the bottom, the viewport is always glued to the
+        // end of the content, so appended items / growth are followed without
+        // waiting for the async anchor side effect.
+        let sy = if *stick.read() {
+            max_scroll
+        } else {
+            // Clamp the derived scroll so content that shrank below the
+            // viewport does not leave a blank area.
+            scroll_y.min(max_scroll)
+        };
 
         // Hide the scrollbar once the inactivity timeout elapses and only when
         // there is actually content overflowing the viewport.
@@ -333,10 +401,18 @@ impl<T: PartialEq + 'static, B: Fn(usize, &T, Option<f32>) -> Element + 'static>
             move |e: Event<WheelEventData>| {
                 let vh = *viewport_h.read();
                 let (ai, ao) = *anchor.read();
-                let cur = heights.read().offset_of(ai) + ao;
                 let max_scroll = (heights.read().total_height() - vh).max(0.0);
+                // Start from the bottom while sticking, mirroring what render
+                // displays, so the anchor is derived from the right position.
+                let cur = if *stick.read() {
+                    max_scroll
+                } else {
+                    heights.read().offset_of(ai) + ao
+                };
                 let new_y = (cur - e.delta_y as f32).clamp(0.0, max_scroll);
                 anchor.set(heights.read().item_at(new_y));
+                // Follow again only when scrolled all the way back to the bottom.
+                stick.set(max_scroll - new_y < 1.0);
                 scrollbar_timeout.reset();
             }
         };
@@ -355,7 +431,11 @@ impl<T: PartialEq + 'static, B: Fn(usize, &T, Option<f32>) -> Element + 'static>
                 let rel_y = (loc.y - top).clamp(0.0, track_h as f64) as f32;
                 let thumb_h = ((track_h / total.max(1.0)).clamp(0.0, 1.0) * track_h).max(20.0);
                 let (ai, ao) = *anchor.read();
-                let cur = heights.read().offset_of(ai) + ao;
+                let cur = if *stick.read() {
+                    max_scroll
+                } else {
+                    heights.read().offset_of(ai) + ao
+                };
                 let thumb_y = if max_scroll > 0.0 && track_h > thumb_h {
                     (cur / max_scroll) * (track_h - thumb_h)
                 } else {
@@ -371,6 +451,7 @@ impl<T: PartialEq + 'static, B: Fn(usize, &T, Option<f32>) -> Element + 'static>
                     let frac = rel_y / track_h.max(1.0);
                     let target = (frac * max_scroll).clamp(0.0, max_scroll);
                     anchor.set(heights.read().item_at(target));
+                    stick.set(max_scroll - target < 1.0);
                 }
                 scrollbar_timeout.reset();
                 e.prevent_default();
@@ -394,6 +475,7 @@ impl<T: PartialEq + 'static, B: Fn(usize, &T, Option<f32>) -> Element + 'static>
                     };
                     let target = (frac * max_scroll).clamp(0.0, max_scroll);
                     anchor.set(heights.read().item_at(target));
+                    stick.set(max_scroll - target < 1.0);
                     scrollbar_timeout.reset();
                     e.prevent_default();
                 }
@@ -567,5 +649,59 @@ mod tests {
         let data = hd(0);
         assert_eq!(data.total_height(), 0.0);
         assert_eq!(data.item_at(0.0), (0, 0.0));
+    }
+
+    #[test]
+    fn grow_keeps_measured_heights() {
+        let mut data = hd(2);
+        data.set_measured(0, 100.0);
+        data.set_measured(1, 60.0);
+        assert!(data.grow(5));
+        // Measured heights survive; new items fall back to the default.
+        assert_eq!(data.height(0), 100.0);
+        assert_eq!(data.height(1), 60.0);
+        assert_eq!(data.height(2), 40.0);
+        assert_eq!(data.height(4), 40.0);
+        assert_eq!(data.total_height(), 100.0 + 60.0 + 40.0 * 3.0 + 4.0 * 4.0);
+        assert_eq!(data.offset_of(3), 100.0 + 60.0 + 40.0 + 4.0 * 3.0);
+        // Growing to a smaller or equal length is a no-op.
+        assert!(!data.grow(5));
+        assert!(!data.grow(2));
+    }
+
+    #[test]
+    fn grow_across_chunk_boundaries() {
+        // 60 items end mid-chunk (chunk 0 is partially filled).
+        let mut data = hd(60);
+        for i in 0..60 {
+            data.set_measured(i, 30.0);
+        }
+        // Grow past the chunk boundary: chunk 0 gets topped up, chunk 1 is new.
+        assert!(data.grow(CHUNK_SIZE + 6));
+        let expected_total: f32 = 30.0 * 60.0 + 40.0 * 10.0 + 4.0 * (CHUNK_SIZE + 5) as f32;
+        assert!((data.total_height() - expected_total).abs() < 0.001);
+        assert_eq!(data.height(63), 40.0); // new item in the topped-up chunk 0
+        assert_eq!(data.height(CHUNK_SIZE + 1), 40.0); // new chunk item
+                                                       // offsets stay consistent with a naive accumulation
+        let mut acc = 0.0;
+        for i in 0..CHUNK_SIZE + 6 {
+            assert!((data.offset_of(i) - acc).abs() < 0.001, "i={i}");
+            acc += data.height(i) + 4.0;
+        }
+    }
+
+    #[test]
+    fn grow_from_aligned_chunk_boundary() {
+        let mut data = hd(CHUNK_SIZE * 2);
+        for i in 0..CHUNK_SIZE * 2 {
+            data.set_measured(i, 20.0);
+        }
+        assert!(data.grow(CHUNK_SIZE * 2 + 3));
+        let expected_total =
+            20.0 * (CHUNK_SIZE * 2) as f32 + 40.0 * 3.0 + 4.0 * (CHUNK_SIZE * 2 + 2) as f32;
+        assert!((data.total_height() - expected_total).abs() < 0.001);
+        // Only the brand-new chunk was added.
+        assert_eq!(data.chunk_sums.len(), 3);
+        assert!((data.chunk_sums[2] - 40.0 * 3.0).abs() < 0.001);
     }
 }

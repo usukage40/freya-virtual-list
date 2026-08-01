@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{cell::RefCell, rc::Rc, time::Duration};
 
 use freya::prelude::*;
 use freya_testing::prelude::*;
@@ -182,4 +182,159 @@ fn scrollbar_drag_scrolls() {
         first > 500,
         "expected to scroll far down, got first item: {first}"
     );
+}
+
+/// A bottom-sticking list whose items live in shared state, so tests can
+/// append items and bump a global state to trigger a re-render.
+fn stick_list_app(
+    count: usize,
+    height: f32,
+) -> (Rc<RefCell<Vec<String>>>, State<u32>, impl Fn() -> Element) {
+    let items = Rc::new(RefCell::new(
+        (0..count).map(|i| format!("Item {i}")).collect::<Vec<_>>(),
+    ));
+    let bump = State::create_global(0u32);
+    let app_items = items.clone();
+    let app_bump = bump;
+    let app = move || -> Element {
+        let _ = *app_bump.read(); // re-render when the test bumps
+        let list = app_items.borrow().clone();
+        rect()
+            .width(Size::fill())
+            .height(Size::fill())
+            .child(
+                VirtualList::new(list, move |i, text, _measured_h| {
+                    label()
+                        .key(i)
+                        .height(Size::px(height))
+                        .text(text.clone())
+                        .into()
+                })
+                .default_item_height(height)
+                .stick_to_bottom(true),
+            )
+            .into()
+    };
+    (items, bump, app)
+}
+
+#[test]
+fn stick_to_bottom_starts_at_bottom() {
+    let (_, _, app) = stick_list_app(1000, 50.);
+    let mut test = launch_test(app);
+    test.sync_and_update();
+
+    let labels = rendered_labels(&test);
+    // The last item is visible and everything rendered is near the end
+    // (the first rendered label is the overscan margin above the viewport).
+    assert!(labels.contains(&"Item 999".to_string()));
+    let first: usize = labels[0].strip_prefix("Item ").unwrap().parse().unwrap();
+    assert!(
+        first >= 980,
+        "expected to start at the bottom, got first item: {first}"
+    );
+}
+
+#[test]
+fn follows_appended_items() {
+    let (items, mut bump, app) = stick_list_app(1000, 50.);
+    let mut test = launch_test(app);
+    test.sync_and_update();
+    assert!(rendered_labels(&test).contains(&"Item 999".to_string()));
+
+    // Appending an item keeps the viewport glued to the bottom.
+    items.borrow_mut().push("Item 1000".to_string());
+    *bump.write() += 1;
+    test.sync_and_update();
+    test.poll(Duration::from_millis(10), Duration::from_millis(30)); // let grow run
+
+    let labels = rendered_labels(&test);
+    assert!(labels.contains(&"Item 1000".to_string()));
+    assert!(labels.contains(&"Item 999".to_string()));
+}
+
+#[test]
+fn last_item_growth_keeps_bottom() {
+    let heights = Rc::new(RefCell::new(vec![50.0f32; 1000]));
+    let mut bump = State::create_global(0u32);
+    let app_heights = heights.clone();
+    let app_bump = bump;
+    let app = move || -> Element {
+        let _ = *app_bump.read();
+        let items = (0..1000).map(|i| format!("Item {i}")).collect::<Vec<_>>();
+        let heights = app_heights.clone();
+        rect()
+            .width(Size::fill())
+            .height(Size::fill())
+            .child(
+                VirtualList::new(items, move |i, text, _measured_h| {
+                    let h = heights.borrow()[i];
+                    label().key(i).height(Size::px(h)).text(text.clone()).into()
+                })
+                .default_item_height(50.)
+                .stick_to_bottom(true),
+            )
+            .into()
+    };
+    let mut test = launch_test(app);
+    test.sync_and_update();
+    assert!(rendered_labels(&test).contains(&"Item 999".to_string()));
+
+    // The last item grows from 50px to 300px; the viewport must stay glued.
+    let mut h = heights.borrow_mut();
+    h[999] = 300.0;
+    drop(h);
+    *bump.write() += 1;
+    test.sync_and_update();
+
+    let labels = rendered_labels(&test);
+    assert!(
+        labels.contains(&"Item 999".to_string()),
+        "viewport should stay at the bottom after the last item grows: {labels:?}"
+    );
+}
+
+#[test]
+fn scrolling_up_stops_following() {
+    let (items, mut bump, app) = stick_list_app(1000, 50.);
+    let mut test = launch_test(app);
+    test.sync_and_update();
+
+    // Scroll up (positive delta = towards older content), leaving the bottom.
+    test.scroll((5., 5.), (0., 200.));
+    test.sync_and_update();
+    let before = rendered_labels(&test);
+    let first: usize = before[0].strip_prefix("Item ").unwrap().parse().unwrap();
+    // Just above the very bottom (moved ~200px up), so no long-jump happened.
+    assert!(
+        (980..998).contains(&first),
+        "expected to be just above the bottom, got first item: {first}"
+    );
+
+    // Appending must NOT move the viewport while the user is scrolled up.
+    items.borrow_mut().push("Item 1000".to_string());
+    *bump.write() += 1;
+    test.sync_and_update();
+    test.poll(Duration::from_millis(10), Duration::from_millis(30)); // let grow run
+    assert_eq!(rendered_labels(&test), before);
+}
+
+#[test]
+fn scrolling_back_to_bottom_resumes() {
+    let (items, mut bump, app) = stick_list_app(1000, 50.);
+    let mut test = launch_test(app);
+    test.sync_and_update();
+
+    // Leave the bottom, then scroll all the way back down.
+    test.scroll((5., 5.), (0., 200.));
+    test.sync_and_update();
+    test.scroll((5., 5.), (0., -100000.));
+    test.sync_and_update();
+
+    // Appending now follows again.
+    items.borrow_mut().push("Item 1000".to_string());
+    *bump.write() += 1;
+    test.sync_and_update();
+    test.poll(Duration::from_millis(10), Duration::from_millis(30)); // let grow run
+    assert!(rendered_labels(&test).contains(&"Item 1000".to_string()));
 }

@@ -20,6 +20,10 @@ viewport are corrected.
 - **Auto-hiding scrollbar** — draggable thumb, click-to-jump on the track, and
   a configurable idle delay after which the scrollbar fades out (200 ms
   animation) instead of disappearing instantly.
+- **Stick to bottom** — for chat histories / live logs: start at the bottom,
+  follow content that grows at the end (appended items or a taller last item),
+  pause following while the user scrolls up, and resume when they scroll back
+  to the bottom.
 
 ## Usage
 
@@ -68,8 +72,9 @@ height, if any).
 | `item_gap(gap: f32)` | `0.0` | Vertical gap between items. |
 | `overscan(n: usize)` | `3` | Extra items rendered above/below the viewport. |
 | `scrollbar_hide_delay(duration: Duration)` | `800ms` | How long the scrollbar stays visible after the last scroll/drag/hover, before it fades out. |
+| `stick_to_bottom(stick: bool)` | `false` | Start at the bottom and follow content that grows at the end. Following pauses when the user scrolls away and resumes on returning to the bottom. |
 
-## Example
+## Examples
 
 ```sh
 cargo run --example random_text_list
@@ -77,6 +82,14 @@ cargo run --example random_text_list
 
 Renders 5,000 randomly generated text items with varying line counts,
 demonstrating the variable-height support.
+
+```sh
+cargo run --example stick_to_bottom_list
+```
+
+Same content, but with `stick_to_bottom(true)`: the list starts at the bottom
+and follows appended items. Press **Space** to append an item and watch the
+viewport stick to the bottom; scroll up to pause following.
 
 ## Tests
 
