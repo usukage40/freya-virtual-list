@@ -1,0 +1,13 @@
+[package]
+name = "freya-virtual-list"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "freya_virtual_list"
+
+[dependencies]
+freya = { git = "https://github.com/marc2332/freya", rev = "156512317eda19da23e7b14935c15504b2e368d7", features = ["sdk"] }
+
+[dev-dependencies]
+freya-testing = { git = "https://github.com/marc2332/freya", rev = "156512317eda19da23e7b14935c15504b2e368d7" }
